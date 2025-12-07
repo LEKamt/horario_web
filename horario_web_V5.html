@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Visualizador de Horarios - CSV</title>
+  <style>
+    :root{--left-width:320px;--slot-height:30px;--time-col-width:60px}
+    body{font-family: Inter, system-ui, Arial, sans-serif; margin:0; height:100vh; display:flex;}
+    .sidebar{width:var(--left-width); border-right:1px solid #ddd; padding:12px; box-sizing:border-box; overflow:auto}
+    .main{flex:1; display:flex; flex-direction:column}
+    header{padding:10px 12px; border-bottom:1px solid #eee; display:flex; gap:12px; align-items:center}
+    .uploader{display:flex; gap:8px; align-items:center}
+    .search{margin-left:auto}
+    .controls{display:flex; gap:8px; align-items:center}
+    .course-list{margin-top:12px}
+    .course-item{padding:6px; border-radius:6px; cursor:pointer; display:flex; gap:8px; align-items:center; border:1px solid transparent}
+    .course-item:hover{background:#f6f6f6}
+    .course-color{width:18px;height:18px;border-radius:4px}
+    .course-meta{font-size:12px;color:#555}
+
+    .board-wrap{flex:1; overflow:auto; padding:12px}
+    .board{position:relative; min-width:900px; display:flex}
+    .time-col{width:var(--time-col-width); border-right:1px solid #eee}
+    .time-slot{height:var(--slot-height); font-size:12px; color:#666; display:flex; align-items:flex-end; justify-content:flex-end; padding-right:8px; padding-bottom:2px; box-sizing:border-box}
+    .days{flex:1; display:flex}
+    .day-col{flex:1; border-right:1px solid #f0f0f0; position:relative; min-width:120px}
+    .day-header{height:36px; text-align:center; border-bottom:1px solid #eee; display:flex; align-items:center; justify-content:center}
+    .grid{position:relative}
+
+    .session{position:absolute; left:6px; right:6px; border-radius:6px; padding:4px 6px; color:#fff; font-size:12px; box-shadow:0 1px 4px rgba(0,0,0,0.12); cursor:default; overflow:hidden}
+    .session .small{font-size:11px; opacity:0.95}
+    .session-close{position:absolute; top:2px; right:2px; background:rgba(0,0,0,0.2); width:16px; height:16px; border-radius:50%; display:flex; align-items:center; justify-content:center; cursor:pointer; font-size:12px; line-height:1; opacity:0.7}
+    .session-close:hover{background:rgba(0,0,0,0.4); opacity:1}
+    .legend{margin-top:12px; font-size:13px}
+
+    .hint{font-size:13px;color:#333}
+    .footer-note{padding:8px 12px; border-top:1px solid #eee}
+    .btn{padding:6px 10px;border-radius:6px;border:1px solid #bbb;background:#fafafa;cursor:pointer}
+
+    @media (max-width:900px){:root{--left-width:260px}}
+  </style>
+</head>
+<body>
+  <aside class="sidebar">
+    <h3>Panel de cursos</h3>
+    <div class="uploader">
+      <label class="btn">
+        Cargar CSV <input id="csvfile" type="file" accept=".csv" style="display:none">
+      </label>
+      <div class="controls">
+        <button id="clearAll" class="btn">Limpiar selección</button>
+      </div>
+    </div>
+    <div style="margin-top:8px">
+      <input id="search" placeholder="Buscar por código, curso o docente" style="width:100%; padding:6px; box-sizing:border-box">
+    </div>
+
+    <div class="course-list" id="courseList" role="list"></div>
+
+    <div class="legend" id="legend"></div>
+  </aside>
+
+  <main class="main">
+    <header>
+      <div class="hint">Horarios: selecciona cursos en el panel izquierdo para verlos en el calendario. Válido para archivos con columnas: <code>Código Curso, Curso, Sección, Sesión, Modalidad, Horario, Frecuencia, Aula, Capacidad, Docente, Correo</code>.</div>
+      <div class="search" style="display:flex; gap:8px; align-items:center">
+        <label class="btn"><input id="showCodes" type="checkbox" style="margin-right:6px"> Mostrar códigos</label>
+      </div>
+    </header>
+
+    <div class="board-wrap">
+      <div class="board" id="board">
+        <div class="time-col" id="timeCol"></div>
+        <div class="days" id="daysCol"></div>
+      </div>
+    </div>
+
+    <div class="footer-note"></div>
+  </main>
+
+  <script src="https://unpkg.com/papaparse@5.3.2/papaparse.min.js"></script>
+  <script>
+    // Configuraciones
+    const DAYS = ['Lun','Mar','Mié','Jue','Vie','Sáb']; // indices 0..5
+    const DAY_FULL = ['Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
+
+    let courses = {}; // key: unique id (Código Curso + Sección), value: {code,name,section,sessions:[]}
+    let shown = new Set();
+    let colors = {};
+
+    const csvInput = document.getElementById('csvfile');
+    const courseListEl = document.getElementById('courseList');
+    const daysCol = document.getElementById('daysCol');
+    const timeCol = document.getElementById('timeCol');
+    const legendEl = document.getElementById('legend');
+    const searchInput = document.getElementById('search');
+    const clearAllBtn = document.getElementById('clearAll');
+    const showCodesCheckbox = document.getElementById('showCodes');
+
+    csvInput.addEventListener('change', (e)=>{
+      const f = e.target.files[0];
+      if(!f) return;
+      Papa.parse(f, {header:true,  encoding: "ISO-8859-1", skipEmptyLines:true, complete: (res)=>{
+        loadFromRows(res.data);
+      }});
+    });
+
+    clearAllBtn.addEventListener('click', ()=>{
+      shown.clear(); renderBoard(); updateListHighlight(); renderLegend();
+    });
+
+    searchInput.addEventListener('input', ()=> renderCourseList());
+    showCodesCheckbox.addEventListener('change', ()=> renderCourseList());
+
+    function loadFromRows(rowsRaw){
+      // clear
+      courses={}; colors={}; shown.clear();
+      // find header keys mapping
+      const sample = rowsRaw[0] || {};
+      const keys = Object.keys(sample);
+      // helpers to detect column
+      function findKey(possible){ for(const p of possible) if(keys.find(k=>k.trim().toLowerCase()===p.toLowerCase())) return keys.find(k=>k.trim().toLowerCase()===p.toLowerCase()); return null }
+      const K_CODE = findKey(['Código Curso','Codigo Curso','Código','Codigo','Código_Curso']) || 'Código Curso';
+      const K_CURSO = findKey(['Curso','Nombre Curso','Nombre','Materia']) || 'Curso';
+      const K_SECCION = findKey(['Sección','Seccion','Sección ','Seccion ']) || 'Sección';
+      const K_SESION = findKey(['Sesión','Sesion','Sesión Grupo','Sesión Grupo ']) || 'Sesión';
+      const K_MODAL = findKey(['Modalidad','Modalidad ']) || 'Modalidad';
+      const K_HORARIO = findKey(['Horario','Horario ']) || 'Horario';
+      const K_DOC = findKey(['Docente','Profesor','Docente ']) || 'Docente';
+
+      rowsRaw.forEach(r=>{
+        const code = String(r[K_CODE] ?? '').trim();
+        const curso = String(r[K_CURSO] ?? '').trim();
+        const seccion = String(r[K_SECCION] ?? '').trim();
+        const sesion = String(r[K_SESION] ?? '').trim();
+        const modalidad = String(r[K_MODAL] ?? '').trim();
+        const horario = String(r[K_HORARIO] ?? '').trim();
+        const docente = String(r[K_DOC] ?? '').trim();
+        if(!horario) return; // skip entries without horario
+
+        const key = code + '|' + seccion + '|' + curso;
+        if(!courses[key]) courses[key] = {code, curso, seccion, docente, modalidad, sessions: []};
+
+        // parse horario - could contain multiple day entries separated by "," or ";"
+        // Examples: "Lun. 08:00 - 12:00" or "Lun., Mie. 08:00 - 10:00"
+        const parts = horario.split(/[;,]+/).map(s=>s.trim()).filter(Boolean);
+        parts.forEach(p=>{
+          // find day tokens and time range
+          // Extract time range HH:MM - HH:MM
+          const timeMatch = p.match(/(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})/);
+          if(!timeMatch) return;
+          const t0 = timeMatch[1]; const t1 = timeMatch[2];
+          // Day tokens are before the time match
+          const before = p.slice(0, timeMatch.index).trim();
+          // split days by space or ","
+          const dayTokens = before.split(/\s+|,|\./).map(s=>s.trim()).filter(Boolean);
+          // If no explicit day token, attempt to find tokens like Lun,Mar
+          const daysFound = [];
+          for(const tok of dayTokens){
+            const t = tok.normalize('NFD').replace(/[\u0300-\u036f]/g, "");
+            const short = t.slice(0,3).toLowerCase();
+            for(let i=0;i<DAYS.length;i++){
+              const dayNorm = DAYS[i].normalize('NFD').replace(/[\u0300-\u036f]/g, "");
+              if(dayNorm.toLowerCase().slice(0,3)===short || dayNorm.toLowerCase().startsWith(short)) daysFound.push(i);
+            }
+          }
+          if(daysFound.length===0){
+            // try to match any Day names inside the string
+            for(let i=0;i<DAYS.length;i++){
+              const dayNorm = DAYS[i].normalize('NFD').replace(/[\u0300-\u036f]/g, "");
+              const re = new RegExp(dayNorm.slice(0,3),'i'); 
+              if(re.test(p.normalize('NFD').replace(/[\u0300-\u036f]/g, ""))) daysFound.push(i);
+            }
+          }
+          if(daysFound.length===0) return; // can't map day
+
+          daysFound.forEach(didx=>{
+            courses[key].sessions.push({day:didx, start: t0, end: t1, raw: p, sesion, modalidad});
+          });
+        });
+      });
+
+      // determine time range
+      const allTimes = [];
+      Object.values(courses).forEach(c=> c.sessions.forEach(s=>{ allTimes.push(s.start); allTimes.push(s.end);}));
+      const [minTime, maxTime] = computeTimeBounds(allTimes);
+
+      renderTimeAxis(minTime, maxTime);
+      renderDays(minTime, maxTime);
+      renderCourseList();
+      renderLegend();
+    }
+
+    function computeTimeBounds(times){
+      // times: array of 'HH:MM'
+      if(times.length===0) return ['07:00','20:00'];
+      let min = 24*60, max=0;
+      times.forEach(t=>{
+        const [h,m] = t.split(':').map(Number); if(Number.isNaN(h)) return; const mins = h*60+m; min=Math.min(min,mins); max=Math.max(max,mins);
+      });
+      // expand a bit
+      min = Math.max(6*60, Math.floor(min/30)*30);
+      max = Math.min(22*60, Math.ceil(max/30)*30);
+      return [minsToStr(min), minsToStr(max)];
+    }
+    
+    function minsToStr(m){ 
+      const hh = Math.floor(m/60); 
+      const mm = m%60; 
+      return String(hh).padStart(2,'0')+':'+String(mm).padStart(2,'0') 
+    }
+
+    function renderTimeAxis(minTime, maxTime){
+      timeCol.innerHTML='';
+      const [minH,minM]=minTime.split(':').map(Number); 
+      const [maxH,maxM]=maxTime.split(':').map(Number);
+      let cursor = minH*60+minM;
+      const end = maxH*60+maxM;
+      while(cursor<end){
+        const div = document.createElement('div'); 
+        div.className='time-slot'; 
+        div.textContent = minsToStr(cursor);
+        timeCol.appendChild(div); 
+        cursor += 30;
+      }
+    }
+
+    function renderDays(minTime, maxTime){
+      daysCol.innerHTML='';
+      for(let d=0; d<DAYS.length; d++){
+        const col = document.createElement('div'); 
+        col.className='day-col'; 
+        col.dataset.day=d;
+        const h = document.createElement('div'); 
+        h.className='day-header'; 
+        h.textContent = DAY_FULL[d]; 
+        col.appendChild(h);
+        const grid = document.createElement('div'); 
+        grid.className='grid'; 
+        grid.style.position='relative'; 
+        columnGridAppend(grid);
+        col.appendChild(grid);
+        daysCol.appendChild(col);
+      }
+
+      function columnGridAppend(grid){
+        // add empty slots to match time axis height
+        grid.style.minHeight = timeCol.scrollHeight + 'px';
+      }
+    }
+
+    function renderCourseList(){
+      courseListEl.innerHTML='';
+      const q = searchInput.value.trim().toLowerCase();
+      const items = Object.entries(courses).sort((a,b)=> a[1].curso.localeCompare(b[1].curso));
+      items.forEach(([key,c])=>{
+        if(q){
+          const hay = (c.code+' '+c.curso+' '+(c.docente||'')).toLowerCase(); 
+          if(!hay.includes(q)) return;
+        }
+        const item = document.createElement('div'); 
+        item.className='course-item'; 
+        item.dataset.key=key;
+        const color = getColorFor(key);
+        const dot = document.createElement('div'); 
+        dot.className='course-color'; 
+        dot.style.background=color;
+        const title = document.createElement('div');
+        const titleLine = document.createElement('div'); 
+        titleLine.textContent = (showCodesCheckbox.checked? (c.code + ' - '):'') + c.curso + (c.seccion? (' (S'+c.seccion+')') : '');
+        const meta = document.createElement('div'); 
+        meta.className='course-meta'; 
+        meta.textContent = `${c.docente || ''} • ${c.modalidad || ''} • ${c.sessions.length} sesión(es)`;
+        title.appendChild(titleLine); 
+        title.appendChild(meta);
+        item.appendChild(dot); 
+        item.appendChild(title);
+        item.addEventListener('click', ()=>{ 
+          toggleCourse(key); 
+          item.classList.toggle('active'); 
+        });
+        if(shown.has(key)) item.style.background='#eefaf6';
+        courseListEl.appendChild(item);
+      });
+    }
+
+    function getColorFor(key){ 
+      if(colors[key]) return colors[key]; 
+      const hue = Math.floor(Math.abs(hashCode(key))%360); 
+      const color = `hsl(${hue} 70% 45%)`; 
+      colors[key]=color; 
+      return color 
+    }
+    
+    function hashCode(s){ 
+      let h=0; 
+      for(let i=0;i<s.length;i++){ 
+        h = ((h<<5)-h)+s.charCodeAt(i); 
+        h|=0;
+      } 
+      return h 
+    }
+
+    function toggleCourse(key){ 
+      if(shown.has(key)) shown.delete(key); 
+      else shown.add(key); 
+      renderBoard(); 
+      updateListHighlight(); 
+      renderLegend(); 
+    }
+    
+    function updateListHighlight(){ 
+      document.querySelectorAll('.course-item').forEach(el=>{ 
+        el.style.background = shown.has(el.dataset.key)? '#eefaf6' : 'transparent' 
+      }); 
+    }
+
+    function renderBoard(){
+      // clear existing sessions
+      document.querySelectorAll('.session').forEach(n=>n.remove());
+      if(Object.keys(courses).length===0) return;
+      // compute time bounds again
+      const allTimes = [];
+      Object.values(courses).forEach(c=> c.sessions.forEach(s=>{ 
+        allTimes.push(s.start); 
+        allTimes.push(s.end);
+      }));
+      const [minTime, maxTime] = computeTimeBounds(allTimes);
+      const [minH,minM]=minTime.split(':').map(Number); 
+      const startMins = minH*60+minM;
+      const [maxH,maxM]=maxTime.split(':').map(Number); 
+      const endMins = maxH*60+maxM;
+      const totalMins = endMins - startMins;
+      const pixelsPerMin = timeCol.scrollHeight / totalMins;
+
+      // for each shown course, add sessions
+      shown.forEach(key=>{
+        const c = courses[key]; 
+        if(!c) return;
+        const color = getColorFor(key);
+        c.sessions.forEach(s=>{
+          const dayCol = document.querySelector(`.day-col[data-day='${s.day}'] .grid`);
+          if(!dayCol) return;
+          const sstart = toMins(s.start); 
+          const send = toMins(s.end);
+          const top = Math.max(0, (sstart - startMins) * pixelsPerMin);
+          const height = Math.max(18, (send - sstart) * pixelsPerMin - 4);
+          const el = document.createElement('div'); 
+          el.className='session';
+          el.style.top = top + 'px'; 
+          el.style.height = height + 'px'; 
+          el.style.background = color; 
+          el.style.opacity = 0.95;
+          
+          // Agregar botón de cierre (x)
+          const closeBtn = document.createElement('div');
+          closeBtn.className = 'session-close';
+          closeBtn.innerHTML = '×';
+          closeBtn.title = 'Quitar curso';
+          closeBtn.addEventListener('click', (e)=>{
+            e.stopPropagation();
+            shown.delete(key);
+            renderBoard();
+            updateListHighlight();
+            renderLegend();
+          });
+          
+          el.innerHTML = `<div class="small"><strong>${c.curso}</strong></div><div class="small">${c.code} • ${s.start} - ${s.end}</div>`;
+          el.title = `${c.curso} — ${c.code} — ${s.start} - ${s.end} — ${c.docente || ''}`;
+          el.appendChild(closeBtn);
+          dayCol.appendChild(el);
+        });
+      });
+    }
+
+    function toMins(t){ 
+      const [h,m]=t.split(':').map(Number); 
+      return h*60 + (m||0); 
+    }
+
+    function renderLegend(){
+      legendEl.innerHTML = '';
+      const shownArr = Array.from(shown);
+      if(shownArr.length===0){ 
+        legendEl.textContent = 'Ningún curso seleccionado'; 
+        return; 
+      }
+      shownArr.forEach(k=>{
+        const c = courses[k]; 
+        if(!c) return; 
+        const row = document.createElement('div'); 
+        row.style.display='flex'; 
+        row.style.gap='8px'; 
+        row.style.alignItems='center'; 
+        row.style.marginBottom='6px';
+        const dot = document.createElement('div'); 
+        dot.style.width='14px'; 
+        dot.style.height='14px'; 
+        dot.style.background=getColorFor(k); 
+        dot.style.borderRadius='4px';
+        const txt = document.createElement('div'); 
+        txt.textContent = `${c.curso} (${c.code}) — ${c.seccion?('S'+c.seccion):''}`;
+        row.appendChild(dot); 
+        row.appendChild(txt); 
+        legendEl.appendChild(row);
+      });
+    }
+
+    // utility: load example when pressing Ctrl+E for testing (not needed but helpful)
+    window.addEventListener('keydown',(e)=>{ 
+      if(e.ctrlKey && e.key==='e'){ 
+        e.preventDefault(); 
+        loadExample(); 
+      } 
+    });
+
+    function loadExample(){
+      // small embedded example CSV to test UI
+      const csv = `Código Curso;Curso;Sección;Sesión;Modalidad;Horario;Frecuencia;Aula;Capacidad;Docente;Correo
+CS2023;Algoritmos y Estructuras de Datos;1;TEORÍA 1;Presencial;Lun. 08:00 - 10:00;Semana General;A101;40;Yarasca Moscol;email@dom.com
+CS2023;Algoritmos y Estructuras de Datos;1;LAB;Presencial;Mar. 08:00 - 10:00;Semana General;Lab1;20;Yarasca Moscol;email@dom.com
+HH5101;Ética y Tecnología;1;TEORÍA;Presencial;Mié. 10:00 - 12:00;Semana General;A102;50;Arana Alencastre;jarana@utec.edu.pe`;
+      Papa.parse(csv, {header:true,  encoding: "ISO-8859-1", skipEmptyLines:true, complete: (res)=> loadFromRows(res.data)});
+    }
+
+    // expose some helpers for debugging
+    window._debug = {courses, renderBoard, renderCourseList, loadExample};
+  </script>
+</body>
+</html>
